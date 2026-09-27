@@ -220,20 +220,28 @@ def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log: 
     venv Python has no application ID and is not platform-entitled, so every LAN connect from the
     launchd gateway dies with ``EHOSTUNREACH`` while the same code works from Terminal (whose grant it
     inherits). An ad-hoc-signed helper .app does not help: nehelper never prompts for it and denies
-    (#57812 dead-end table, re-verified live on macOS 26.3). ``/usr/bin/osascript``'s ``do shell script``
-    spawns its child as osascript-responsible — an Apple platform binary — so the child is exempt;
-    ``/bin/sh -c exec …`` and ``/usr/bin/time`` wrappers are NOT (the launchd job identity is the
-    non-entitled first executable). ``do shell script`` buffers the child's stdout/stderr until it exits,
-    so the command appends both to the same files the plist's ``StandardOutPath``/``StandardErrorPath``
-    name (those keys stay: they are where osascript's own output lands — an empty result line per exit
-    and an un-timestamped ``execution error`` line on non-zero exit); ``exec`` keeps the
-    gateway a direct child in the job's process group, so ``launchctl bootout`` / ``kickstart -k`` still
-    deliver SIGTERM to it and KeepAlive's ``SuccessfulExit`` semantics are preserved (osascript exits 0
-    exactly when the shell did).
+    (#57812 dead-end table, re-verified live on macOS 26.3). ``/usr/bin/osascript`` spawning the child
+    makes it osascript-responsible — an Apple platform binary — so the child is exempt; ``/bin/sh -c
+    exec …`` and ``/usr/bin/time`` wrappers are NOT (the launchd job identity is the non-entitled first
+    executable).
+
+    Standard Additions' ``do shell script`` polls WindowServer for a user-cancel event while it waits.
+    That is appropriate for a short interactive script but, for the gateway's process lifetime, burns CPU
+    and keeps a WindowServer event connection busy (external-display wake stalls ~10s on macOS 27, #123595).
+    JXA calling libc ``system()`` waits in the kernel instead while retaining osascript as the responsible
+    process. The shell's ``exec`` keeps the gateway in the launchd job's process group, so ``launchctl
+    bootout`` / ``kickstart -k`` still deliver SIGTERM to it. stdout/stderr are appended inside the shell
+    command because ``system()`` otherwise inherits osascript's plist log handles. The encoded wait status
+    is translated back to a process exit code so KeepAlive's ``SuccessfulExit`` semantics are preserved.
     """
     shell = f"exec {shlex.join(command)} >> {shlex.quote(str(stdout_log))} 2>> {shlex.quote(str(stderr_log))}"
-    applescript = shell.replace("\\", "\\\\").replace('"', '\\"')
-    return ["/usr/bin/osascript", "-e", f'do shell script "{applescript}"']
+    javascript = (
+        'ObjC.import("stdlib"); '
+        f"const status=$.system({json.dumps(shell)}); "
+        "const signal=status & 127; "
+        "$.exit(status === -1 ? 1 : signal === 0 ? (status >> 8) & 255 : 128 + signal);"
+    )
+    return ["/usr/bin/osascript", "-l", "JavaScript", "-e", javascript]
 
 
 def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor: bool = False) -> list[str]:
@@ -461,32 +469,48 @@ def launchd_plist_is_current() -> bool:
 def launchd_plist_is_bootable(plist_text: str) -> bool:
     """Whether the launcher in *plist_text* can activate a dependency environment, without running it.
 
-    ``installation_command`` emits one of two command shapes: a ``<root>/.hermes/bin/hermes``
-    shim (a store Python is recorded for the root), or a store-Python bootstrap whose
-    ``sys.path`` anchor is the root (no recorded store Python) -- matched through the escape noise
-    the plist layers (``shlex.join``, osascript quoting, XML escaping) leave around the literal.
+    Decode the plist, osascript wrapper and shell quoting before reading either the launcher
+    shim path or the bootstrap's literal ``sys.path`` anchor. Paths may contain spaces or quotes.
     Launchers on roots without a committed dependency environment refuse at exec ("no dependency
     environment is committed for this install"; see ``activate_dependencies`` ->
     ``_require_own_dependencies``) and launchd would then crash-loop the job instead of serving.
     Static parse only -- no process is started, and the launcher file itself need not exist yet
     (``_prepare_service_launcher`` publishes it later in the write flow). Unparsed shapes count as
-    bootable so ordinary writes are never blocked (an install root containing spaces lands here:
-    the token scan stops at the space); a bootstrap that would keep a venv interpreter's own
+    bootable so ordinary writes are never blocked; a bootstrap that would keep a venv interpreter's own
     packages is conservatively treated as non-bootable when nothing is committed -- the guard then
     keeps the installed definition, which still boots.
     """
-    import re
+    import ast
+    import plistlib
 
     root: Path | None = None
-    match = re.search(r"exec (\S+?/\.hermes/bin/hermes)(?=[\s'\"]|&|$)", plist_text)
-    if match:
-        root = Path(match.group(1)).parents[2]
-    else:
-        # Escape noise sits between ``insert(0,`` and the literal (``&#x27;\\&quot;&#x27;``), so
-        # skip it rather than expecting a plain quoted string.
-        match = re.search(r"sys\.path\.insert\(0,\s*[^\n]{0,80}?(/[A-Za-z0-9_./+-]+)", plist_text)
-        if match:
-            root = Path(match.group(1))
+    try:
+        arguments = plistlib.loads(plist_text.encode("utf-8"))["ProgramArguments"]
+        script = arguments[arguments.index("-e") + 1]
+        if "JavaScript" in arguments and "$.system(" in script:
+            shell, _ = json.JSONDecoder().raw_decode(script.split("$.system(", 1)[1])
+        elif script.startswith("do shell script "):
+            shell = json.loads(script.removeprefix("do shell script "))
+        else:
+            return True
+        command = shlex.split(shell)
+        if command[0] != "exec":
+            return True
+        if command[1].endswith("/.hermes/bin/hermes"):
+            root = Path(command[1]).parents[2]
+        elif "-c" in command:
+            for node in ast.walk(ast.parse(command[command.index("-c") + 1])):
+                match node:
+                    case ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Attribute(value=ast.Name(id="sys"), attr="path"), attr="insert"
+                        ),
+                        args=[ast.Constant(value=0), ast.Constant(value=str() as anchor)],
+                    ):
+                        root = Path(anchor)
+                        break
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError, SyntaxError, plistlib.InvalidFileException):
+        return True
     if root is None:
         return True
     try:
