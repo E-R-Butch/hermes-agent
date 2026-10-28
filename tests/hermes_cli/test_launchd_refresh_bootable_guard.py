@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import gateway as gw
 
 CHECKOUT = "/opt/hermes-checkout"
@@ -38,18 +40,15 @@ def _launcher_plist(root: str) -> str:
 
 
 def _bootstrap_plist(root: str) -> str:
-    # Emitted when no store Python is recorded for the root: ``runtime_command`` anchors
-    # ``sys.path`` at the root inside the store-Python bootstrap.
-    return (
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n"
-        "    <key>ProgramArguments</key>\n    <array>\n"
-        "        <string>/usr/bin/osascript</string>\n        <string>-e</string>\n"
-        "        <string>do shell script &quot;exec /store/python/bin/python3 -I -c "
-        "&quot;import os, sys, runpy; sys.path.insert(0, '{root}'); import hermes_bootstrap; "
-        "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)&quot; "
-        "&gt;&gt; /tmp/gateway.log 2&gt;&gt; /tmp/gateway.error.log&quot;</string>\n"
-        "    </array>\n</dict>\n</plist>\n"
-    ).format(root=root)
+    import json
+    import plistlib
+    import shlex
+
+    code = f"import sys; sys.path.insert(0, {root!r}); import hermes_bootstrap"
+    shell = "exec " + shlex.join(["/store/python/bin/python3", "-I", "-c", code])
+    return plistlib.dumps({
+        "ProgramArguments": ["/usr/bin/osascript", "-e", "do shell script " + json.dumps(shell)]
+    }).decode("utf-8")
 
 
 def test_predicate_reads_both_command_shapes(monkeypatch):
@@ -107,3 +106,17 @@ def test_install_refuses_to_replace_a_booting_definition_with_a_broken_one(tmp_p
     gw.launchd_install(force=True)
 
     assert plist_path.read_text(encoding="utf-8") == installed
+
+
+@pytest.mark.parametrize("root", ["/opt/with space/hermes", "/opt/user's/hermes", '/opt/with"quote/hermes', "/opt/中文/hermes"])
+@pytest.mark.parametrize("store_python", [None, Path("/store/python/bin/python3")])
+def test_generated_launchers_preserve_quoted_roots(root, store_python, monkeypatch):
+    from hermes_cli import gateway_launchd as gl
+
+    monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda root=None: store_python)
+    monkeypatch.setattr(gw, "PROJECT_ROOT", Path(root))
+    generated = gl.generate_launchd_plist()
+    _committed_for(monkeypatch, set())
+    assert gl.launchd_plist_is_bootable(generated) is False
+    _committed_for(monkeypatch, {root})
+    assert gl.launchd_plist_is_bootable(generated) is True
